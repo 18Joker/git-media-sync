@@ -122,3 +122,19 @@ def folder_state(node: TreeNode, checked: set[str]) -> str:
     if selected == len(files):
         return "all"
     return "partial"
+
+
+def selected_entries(roots: list[TreeNode], checked: set[str]) -> list[FileEntry]:
+    out: list[FileEntry] = []
+
+    def walk(node: TreeNode) -> None:
+        if not node.is_folder:
+            if node.entry is not None and node.entry.relpath in checked:
+                out.append(node.entry)
+            return
+        for child in node.children:
+            walk(child)
+
+    for root in roots:
+        walk(root)
+    return out

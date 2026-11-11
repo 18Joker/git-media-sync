@@ -9,7 +9,26 @@ import qrcode
 from PIL import ImageTk
 
 from downloader.config import Config, ConfigStore, Project
-from downloader.storage import AligoStorage
+from downloader.core import (
+    FileEntry,
+    NotAGitRepo,
+    TreeNode,
+    build_entries,
+    build_tree,
+    folder_state,
+    git_tracked,
+    selected_entries,
+)
+from downloader.storage import AligoStorage, StorageError
+
+STATUS_LABEL = {"pending": "待下载", "overwrite": "将覆盖", "same": "已相同"}
+FOLDER_MARK = {"all": "☑", "partial": "▣", "none": "☐"}
+
+
+def _count_files(node: TreeNode) -> int:
+    if not node.is_folder:
+        return 1 if node.entry is not None else 0
+    return sum(_count_files(c) for c in node.children)
 
 
 def human_size(n: int) -> str:
@@ -123,6 +142,12 @@ class App(tk.Tk):
         self._q = queue.Queue()
         self._login_dialog: LoginDialog | None = None
         self.logged_in = False
+        self._entries: list[FileEntry] = []
+        self._roots: list[TreeNode] = []
+        self._node_by_item: dict[str, TreeNode] = {}
+        self._checked: set[str] = set()
+        self._cancel = threading.Event()
+        self._busy = False
 
         cfg = self.store.load()
         self.projects: list[Project] = list(cfg.projects)
@@ -171,6 +196,7 @@ class App(tk.Tk):
 
         self.center = ttk.Frame(right)
         self.center.grid(row=3, column=0, columnspan=3, sticky="nsew")
+        self._build_center()
 
         ttk.Label(right, text="日志").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.log = tk.Text(right, height=8, state="disabled", wrap="none")
@@ -320,9 +346,206 @@ class App(tk.Tk):
                 self._login_dialog.set_status(f"登录失败：{msg[1]}")
             self._log(f"登录失败：{msg[1]}")
         elif kind == "error":
+            self._set_busy(False)
             messagebox.showerror("错误", msg[1])
             self._log(f"错误：{msg[1]}")
-        # entries / progress / done 由 Task 5 处理
+        elif kind == "entries":
+            self._populate(msg[1])
+            self._set_busy(False)
+            self._log(f"列出 {len(msg[1])} 个 git 未管理文件")
+        elif kind == "progress":
+            self._log(msg[1])
+        elif kind == "done":
+            self._set_busy(False)
+            self._log(msg[1])
+
+    # ---- 树形清单 ----
+    def _build_center(self):
+        self.center.columnconfigure(0, weight=1)
+        self.center.rowconfigure(1, weight=1)
+
+        bar = ttk.Frame(self.center)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        self.list_btn = ttk.Button(bar, text="列出文件", command=self._list_files)
+        self.list_btn.pack(side="left")
+        ttk.Button(bar, text="全选", command=self._select_all).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="全不选", command=self._select_none).pack(side="left", padx=6)
+        ttk.Button(bar, text="反选", command=self._invert).pack(side="left")
+        self.download_btn = ttk.Button(bar, text="下载选中(0)", command=self._download_selected)
+        self.download_btn.pack(side="left", padx=(12, 0))
+        self.cancel_btn = ttk.Button(bar, text="取消", command=self._cancel_download, state="disabled")
+        self.cancel_btn.pack(side="left", padx=6)
+
+        wrap = ttk.Frame(self.center)
+        wrap.grid(row=1, column=0, sticky="nsew")
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(wrap, columns=("size", "status"), selectmode="browse")
+        self.tree.heading("#0", text="名称")
+        self.tree.column("#0", width=320, stretch=True)
+        self.tree.heading("size", text="大小")
+        self.tree.column("size", width=90, anchor="e", stretch=False)
+        self.tree.heading("status", text="状态")
+        self.tree.column("status", width=110, anchor="w", stretch=False)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        self.list_btn.configure(state=state)
+        self.download_btn.configure(state=state)
+        self.cancel_btn.configure(state="normal" if busy else "disabled")
+
+    def _list_files(self):
+        if self._busy:
+            return
+        if not self.logged_in:
+            messagebox.showwarning("提示", "请先扫码登录")
+            return
+        cloud = self.cloud_var.get().strip()
+        local = self.local_var.get().strip()
+        if not cloud or not local:
+            messagebox.showwarning("提示", "请填写云盘路径和本地路径")
+            return
+        self._set_busy(True)
+        self.tree.delete(*self.tree.get_children())
+        self._log(f"正在列出 {cloud} …")
+        self._run(lambda: self._list_worker(cloud, local))
+
+    def _list_worker(self, cloud: str, local: str):
+        try:
+            root = Path(local)
+            tracked = git_tracked(root)
+            entries = build_entries(self.storage.iter_cloud_files(cloud), root, tracked)
+            self._q.put(("entries", entries))
+        except NotAGitRepo as e:
+            self._q.put(("error", f"本地不是 git 仓库或未安装 git：{e}"))
+        except StorageError as e:
+            self._q.put(("error", str(e)))
+        except Exception as e:  # noqa: BLE001 - 后台异常需回报 GUI
+            self._q.put(("error", str(e)))
+
+    def _populate(self, entries: list[FileEntry]):
+        self.tree.delete(*self.tree.get_children())
+        self._entries = entries
+        self._roots = build_tree(entries)
+        self._node_by_item = {}
+        self._checked = {e.relpath for e in entries if e.status in ("pending", "overwrite")}
+
+        def insert(node: TreeNode, parent: str):
+            item = self.tree.insert(
+                parent, "end", text=self._node_text(node),
+                values=self._node_values(node), open=True,
+            )
+            self._node_by_item[item] = node
+            for child in node.children:
+                insert(child, item)
+
+        for root in self._roots:
+            insert(root, "")
+        self._update_download_button()
+
+    def _node_text(self, node: TreeNode) -> str:
+        if node.is_folder:
+            return f"{FOLDER_MARK[folder_state(node, self._checked)]} {node.name}"
+        mark = "☑" if node.entry.relpath in self._checked else "☐"
+        return f"{mark} {node.name}"
+
+    def _node_values(self, node: TreeNode):
+        if node.is_folder:
+            return (f"{_count_files(node)} 个文件", "")
+        return (human_size(node.entry.size), STATUS_LABEL[node.entry.status])
+
+    def _refresh_checks(self):
+        for item, node in self._node_by_item.items():
+            self.tree.item(item, text=self._node_text(node))
+        self._update_download_button()
+
+    def _on_tree_click(self, event):
+        if self.tree.identify_region(event.x, event.y) != "tree":
+            return
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        self._toggle(self._node_by_item[item])
+
+    def _iter_files(self, node: TreeNode):
+        if not node.is_folder:
+            if node.entry is not None:
+                yield node.entry
+            return
+        for child in node.children:
+            yield from self._iter_files(child)
+
+    def _toggle(self, node: TreeNode):
+        if node.is_folder:
+            target = folder_state(node, self._checked) != "all"
+            for f in self._iter_files(node):
+                if target:
+                    self._checked.add(f.relpath)
+                else:
+                    self._checked.discard(f.relpath)
+        else:
+            rp = node.entry.relpath
+            if rp in self._checked:
+                self._checked.discard(rp)
+            else:
+                self._checked.add(rp)
+        self._refresh_checks()
+
+    def _select_all(self):
+        self._checked = {e.relpath for e in self._entries}
+        self._refresh_checks()
+
+    def _select_none(self):
+        self._checked = set()
+        self._refresh_checks()
+
+    def _invert(self):
+        self._checked = {e.relpath for e in self._entries if e.relpath not in self._checked}
+        self._refresh_checks()
+
+    def _update_download_button(self):
+        self.download_btn.configure(text=f"下载选中({len(self._checked)})")
+
+    # ---- 下载 ----
+    def _download_selected(self):
+        if self._busy:
+            return
+        if not self.logged_in:
+            messagebox.showwarning("提示", "请先扫码登录")
+            return
+        files = selected_entries(self._roots, self._checked)
+        if not files:
+            messagebox.showwarning("提示", "没有勾选任何文件")
+            return
+        local = Path(self.local_var.get().strip())
+        self._cancel = threading.Event()
+        self._set_busy(True)
+        self._log(f"开始下载 {len(files)} 个文件 …")
+        self._run(lambda: self._download_worker(files, local))
+
+    def _download_worker(self, files: list[FileEntry], local: Path):
+        ok = fail = 0
+        for e in files:
+            if self._cancel.is_set():
+                break
+            try:
+                self.storage.download_to(e.file_id, local / e.relpath)
+                ok += 1
+                self._q.put(("progress", f"✓ {e.relpath}"))
+            except Exception as ex:  # noqa: BLE001
+                fail += 1
+                self._q.put(("progress", f"✗ {e.relpath}: {ex}"))
+        self._q.put(("done", f"下载完成：成功 {ok}，失败 {fail}"))
+
+    def _cancel_download(self):
+        self._cancel.set()
+        self._log("正在取消 …")
 
     def _log(self, text: str):
         self.log.configure(state="normal")
