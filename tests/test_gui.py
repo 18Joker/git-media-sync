@@ -370,6 +370,16 @@ def test_generate_worker_not_git_repo(app, monkeypatch, tmp_path):
     assert any(m[0] == "error" for m in _drain(app))
 
 
+def test_generate_worker_unexpected_error_reports(app, monkeypatch, tmp_path):
+    monkeypatch.setattr(gui, "git_tracked", lambda root: set())
+
+    def boom(root, tracked, exts):
+        raise RuntimeError("意外错误")
+    monkeypatch.setattr(gui, "scan_media_files", boom)
+    app._generate_worker(str(tmp_path), "")
+    assert any(m[0] == "error" and "生成清单失败" in m[1] for m in _drain(app))
+
+
 def test_generate_requires_no_login(app, monkeypatch, tmp_path):
     app.logged_in = False
     app._set_busy(False)

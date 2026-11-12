@@ -160,6 +160,8 @@ class AligoStorage:
                     if item.type != "folder":
                         by_name[_sanitize(item.name)] = item
                 for mf in mfs:
+                    if mf.path == MANIFEST_NAME:
+                        continue
                     name = mf.path.rsplit("/", 1)[-1]
                     item = by_name.get(name)
                     if item is None:

@@ -102,7 +102,7 @@ def scan_media_files(
         dirnames[:] = [d for d in dirnames if d != ".git"]
         for name in filenames:
             relpath = (Path(dirpath) / name).relative_to(local_root).as_posix()
-            if relpath in tracked:
+            if relpath == MANIFEST_NAME or relpath in tracked:
                 continue
             if os.path.splitext(name)[1].lower().lstrip(".") not in exts:
                 continue

@@ -79,3 +79,10 @@ def test_write_manifest_roundtrip_and_overwrite(tmp_path):
     write_manifest(tmp_path, [])
     assert parse_manifest(p.read_text(encoding="utf-8")).files == []
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_scan_skips_manifest_itself(tmp_path):
+    (tmp_path / "media.gmsync").write_text("{}", encoding="utf-8")
+    (tmp_path / "a.png").write_bytes(b"1")
+    out = scan_media_files(tmp_path, set(), frozenset({"png", "gmsync"}))
+    assert out == [ManifestFile("a.png", 1)]

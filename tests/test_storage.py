@@ -331,3 +331,11 @@ def test_resolve_null_item_raises():
     children = {"root": [_null()]}
     with pytest.raises(StorageError):
         _storage_with(FakeAli(folders, children)).resolve_manifest_files("p", _manifest(ManifestFile("a.png", 3)))
+
+
+def test_resolve_skips_manifest_itself():
+    folders = {"p": _folder("root", "p")}
+    children = {"root": [_file("m", "media.gmsync", 5)]}
+    m = _manifest(ManifestFile("media.gmsync", 5))
+    files, warnings = _storage_with(FakeAli(folders, children)).resolve_manifest_files("p", m)
+    assert files == [] and warnings == []

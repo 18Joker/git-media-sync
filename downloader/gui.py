@@ -547,13 +547,12 @@ class App(tk.Tk):
         root = Path(local)
         try:
             tracked = git_tracked(root)
+            files = scan_media_files(root, tracked, parse_exts(exts))
+            write_manifest(root, files)
         except NotAGitRepo as e:
             self._q.put(("error", f"本地不是 git 仓库或未安装 git：{e}"))
             return
-        try:
-            files = scan_media_files(root, tracked, parse_exts(exts))
-            write_manifest(root, files)
-        except OSError as e:
+        except Exception as e:  # noqa: BLE001 - 后台异常需回报 GUI，否则线程静默死亡卡 busy
             self._q.put(("error", f"生成清单失败：{e}"))
             return
         total = human_size(sum(f.size for f in files))
