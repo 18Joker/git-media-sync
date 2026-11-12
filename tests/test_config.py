@@ -2,7 +2,9 @@ import sys
 
 import pytest
 
+from downloader import config
 from downloader.config import Config, ConfigStore, Project, app_dir
+from downloader.core import CloudFile
 
 
 def test_load_missing_returns_empty(tmp_path):
@@ -39,3 +41,50 @@ def test_load_bad_shape_returns_empty(tmp_path):
     p = tmp_path / "c.json"
     p.write_text('{"projects": [{"name": "x"}]}', encoding="utf-8")
     assert ConfigStore(p).load() == Config([])
+
+
+# ---- 列举缓存 ----
+
+
+def _cf(relpath, size=1):
+    return CloudFile(relpath=relpath, name=relpath.split("/")[-1], size=size, file_id="id-" + relpath)
+
+
+def test_cache_roundtrip(tmp_path):
+    store = config.CacheStore(tmp_path / "cache.json")
+    files = [_cf("a.png"), _cf("d/b.png", 5)]
+    store.save("/云/p", files)
+    loaded, saved_at = store.load("/云/p")
+    assert loaded == files
+    assert saved_at
+
+
+def test_cache_missing_returns_none(tmp_path):
+    assert config.CacheStore(tmp_path / "none.json").load("/x") is None
+
+
+def test_cache_unknown_path_returns_none(tmp_path):
+    store = config.CacheStore(tmp_path / "c.json")
+    store.save("/a", [_cf("x.png")])
+    assert store.load("/b") is None
+
+
+def test_cache_corrupt_returns_none(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text("{ bad", encoding="utf-8")
+    assert config.CacheStore(p).load("/x") is None
+
+
+def test_cache_save_merges_paths(tmp_path):
+    store = config.CacheStore(tmp_path / "c.json")
+    store.save("/a", [_cf("x.png")])
+    store.save("/b", [_cf("y.png")])
+    assert store.load("/a")[0] == [_cf("x.png")]
+    assert store.load("/b")[0] == [_cf("y.png")]
+
+
+def test_cache_save_overwrites_same_path(tmp_path):
+    store = config.CacheStore(tmp_path / "c.json")
+    store.save("/a", [_cf("x.png")])
+    store.save("/a", [_cf("z.png", 9)])
+    assert store.load("/a")[0] == [_cf("z.png", 9)]

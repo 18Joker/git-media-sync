@@ -1,14 +1,17 @@
 """Tkinter 界面：项目管理、扫码登录、线程编排。树形清单与下载在 Task 5 补入 self.center。"""
 import queue
 import threading
+import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import qrcode
+import requests
 from PIL import ImageTk
 
-from downloader.config import Config, ConfigStore, Project
+from downloader.config import CacheStore, Config, ConfigStore, Project
 from downloader.core import (
     FileEntry,
     NotAGitRepo,
@@ -19,10 +22,11 @@ from downloader.core import (
     git_tracked,
     selected_entries,
 )
-from downloader.storage import AligoStorage, StorageError
+from downloader.storage import AligoStorage, DownloadCancelled, StorageError, download_url_to
 
 STATUS_LABEL = {"pending": "待下载", "overwrite": "将覆盖", "same": "已相同"}
 FOLDER_MARK = {"all": "☑", "partial": "▣", "none": "☐"}
+DOWNLOAD_WORKERS = 2
 
 
 def _count_files(node: TreeNode) -> int:
@@ -38,6 +42,22 @@ def human_size(n: int) -> str:
             return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
         size /= 1024
     return f"{size:.1f}TB"
+
+
+def format_eta(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}秒"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}分{s:02d}秒"
+    h, m = divmod(m, 60)
+    return f"{h}小时{m:02d}分"
+
+
+def download_status(done: int, total: int, done_bytes: int, total_bytes: int, speed: float) -> str:
+    eta = format_eta((total_bytes - done_bytes) / speed) if speed > 0 else "--"
+    return f"{done}/{total} · {human_size(int(speed))}/s · 剩余 {eta}"
 
 
 class ProjectDialog(tk.Toplevel):
@@ -133,10 +153,11 @@ class LoginDialog(tk.Toplevel):
 
 
 class App(tk.Tk):
-    def __init__(self, store: ConfigStore, storage: AligoStorage):
+    def __init__(self, store: ConfigStore, storage: AligoStorage, cache: CacheStore | None = None):
         super().__init__()
         self.store = store
         self.storage = storage
+        self.cache = cache if cache is not None else CacheStore()
         self.title("Git 媒体下载器")
         self.geometry("920x620")
         self._q = queue.Queue()
@@ -360,11 +381,23 @@ class App(tk.Tk):
             messagebox.showerror("错误", msg[1])
             self._log(f"错误：{msg[1]}")
         elif kind == "entries":
-            self._populate(msg[1])
+            self._populate(msg[1], preserve=msg[2])
             self._set_busy(False)
             self._log(f"列出 {len(msg[1])} 个 git 未管理文件")
+        elif kind == "cached_entries":
+            self._populate(msg[1])
+            self._log(f"已加载缓存 {len(msg[1])} 个文件（{msg[2]}），后台刷新中…")
+        elif kind == "list_progress":
+            self.dl_status.configure(text=f"已扫描 {msg[1]} 个文件夹 / {msg[2]} 个文件")
         elif kind == "progress":
             self._log(msg[1])
+        elif kind == "dl_start":
+            self.dl_bar.configure(maximum=max(msg[2], 1), value=0)
+            self.dl_status.configure(text=f"0/{msg[1]}")
+        elif kind == "dl_progress":
+            _, done, total, done_b, total_b, speed = msg
+            self.dl_bar.configure(maximum=max(total_b, 1), value=done_b)
+            self.dl_status.configure(text=download_status(done, total, done_b, total_b, speed))
         elif kind == "done":
             self._set_busy(False)
             self._log(msg[1])
@@ -403,6 +436,13 @@ class App(tk.Tk):
         vsb.grid(row=0, column=1, sticky="ns")
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
 
+        prog = ttk.Frame(self.center)
+        prog.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self.dl_bar = ttk.Progressbar(prog, maximum=1, value=0)
+        self.dl_bar.pack(side="left", fill="x", expand=True)
+        self.dl_status = ttk.Label(prog, text="", width=34, anchor="w")
+        self.dl_status.pack(side="left", padx=(8, 0))
+
     def _set_busy(self, busy: bool):
         self._busy = busy
         self.list_btn.configure(state="disabled" if busy else "normal")
@@ -426,17 +466,33 @@ class App(tk.Tk):
         self._run(lambda: self._list_worker(cloud, local))
 
     def _list_worker(self, cloud: str, local: str):
+        root = Path(local)
         try:
-            root = Path(local)
             tracked = git_tracked(root)
-            entries = build_entries(self.storage.iter_cloud_files(cloud), root, tracked)
-            self._q.put(("entries", entries))
         except NotAGitRepo as e:
             self._q.put(("error", f"本地不是 git 仓库或未安装 git：{e}"))
+            return
+        cached = self.cache.load(cloud)
+        if cached is not None:
+            files, saved_at = cached
+            self._q.put(("cached_entries", build_entries(files, root, tracked), saved_at))
+
+        def prog(folders: int, files: int):
+            self._q.put(("list_progress", folders, files))
+
+        try:
+            cloud_files = list(self.storage.iter_cloud_files(cloud, on_progress=prog))
         except StorageError as e:
-            self._q.put(("error", str(e)))
+            if cached is not None:
+                self._q.put(("done", f"刷新失败：{e}（仍显示缓存）"))
+            else:
+                self._q.put(("error", str(e)))
+            return
         except Exception as e:  # noqa: BLE001 - 后台异常需回报 GUI
             self._q.put(("error", str(e)))
+            return
+        self.cache.save(cloud, cloud_files)
+        self._q.put(("entries", build_entries(cloud_files, root, tracked), cached is not None))
 
     def _clear_tree(self):
         self.tree.delete(*self.tree.get_children())
@@ -446,12 +502,22 @@ class App(tk.Tk):
         self._checked = set()
         self._update_download_button()
 
-    def _populate(self, entries: list[FileEntry]):
+    def _populate(self, entries: list[FileEntry], preserve: bool = False):
+        old_checked = self._checked
+        old_relpaths = {e.relpath for e in self._entries}
         self.tree.delete(*self.tree.get_children())
         self._entries = entries
         self._roots = build_tree(entries)
         self._node_by_item = {}
-        self._checked = {e.relpath for e in entries if e.status in ("pending", "overwrite")}
+        if preserve:
+            self._checked = {
+                e.relpath
+                for e in entries
+                if e.relpath in old_checked
+                or (e.relpath not in old_relpaths and e.status in ("pending", "overwrite"))
+            }
+        else:
+            self._checked = {e.relpath for e in entries if e.status in ("pending", "overwrite")}
 
         def insert(node: TreeNode, parent: str):
             item = self.tree.insert(
@@ -551,18 +617,71 @@ class App(tk.Tk):
         self._run(lambda: self._download_worker(files, local))
 
     def _download_worker(self, files: list[FileEntry], local: Path):
-        ok = fail = 0
-        for e in files:
+        ok = fail = cancelled = 0
+        total_bytes = sum(e.size for e in files)
+        done_bytes = 0
+        lock = threading.Lock()
+        self._q.put(("dl_start", len(files), total_bytes))
+
+        def on_bytes(n: int):
+            nonlocal done_bytes
+            with lock:
+                done_bytes += n
+
+        try:
+            urls = self.storage.get_download_urls([e.file_id for e in files])
+        except Exception as ex:  # noqa: BLE001 - 后台异常需回报 GUI
+            urls = {}
+            self._q.put(("progress", f"✗ 获取下载链接失败：{ex}"))
+
+        tls = threading.local()
+
+        def task(e: FileEntry):
             if self._cancel.is_set():
-                break
-            try:
-                self.storage.download_to(e.file_id, local / e.relpath, expected_size=e.size)
-                ok += 1
-                self._q.put(("progress", f"✓ {e.relpath}"))
-            except Exception as ex:  # noqa: BLE001
-                fail += 1
-                self._q.put(("progress", f"✗ {e.relpath}: {ex}"))
-        self._q.put(("done", f"下载完成：成功 {ok}，失败 {fail}"))
+                raise DownloadCancelled()
+            url = urls.get(e.file_id)
+            if not url:
+                raise StorageError("获取下载链接失败")
+            session = getattr(tls, "session", None)
+            if session is None:
+                session = tls.session = requests.Session()
+            self._q.put(("progress", f"↓ {e.relpath}（{human_size(e.size)}）"))
+            t0 = time.monotonic()
+            download_url_to(
+                url, local / e.relpath, e.size,
+                on_progress=on_bytes, cancel=self._cancel, session=session,
+            )
+            dt = time.monotonic() - t0
+            speed = e.size / dt if dt > 0 else 0.0
+            self._q.put((
+                "progress",
+                f"✓ {e.relpath}（{human_size(e.size)}，{dt:.0f}s，{human_size(int(speed))}/s）",
+            ))
+
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            futures = {pool.submit(task, e): e for e in files}
+            pending = set(futures)
+            last_t = time.monotonic()
+            last_b = 0
+            while pending:
+                done_set, pending = wait(pending, timeout=0.5)
+                for f in done_set:
+                    e = futures[f]
+                    try:
+                        f.result()
+                        ok += 1
+                    except DownloadCancelled:
+                        cancelled += 1
+                    except Exception as ex:  # noqa: BLE001
+                        fail += 1
+                        self._q.put(("progress", f"✗ {e.relpath}: {ex}"))
+                now = time.monotonic()
+                with lock:
+                    b = done_bytes
+                speed = (b - last_b) / (now - last_t) if now > last_t else 0.0
+                last_t, last_b = now, b
+                self._q.put(("dl_progress", ok + fail + cancelled, len(files), b, total_bytes, speed))
+        self._q.put(("done", f"下载完成：成功 {ok}，失败 {fail}，取消 {cancelled}"))
 
     def _cancel_download(self):
         self._cancel.set()
@@ -570,6 +689,6 @@ class App(tk.Tk):
 
     def _log(self, text: str):
         self.log.configure(state="normal")
-        self.log.insert("end", text + "\n")
+        self.log.insert("end", f"{time.strftime('%H:%M:%S')} {text}\n")
         self.log.see("end")
         self.log.configure(state="disabled")
