@@ -137,37 +137,37 @@ def test_qr_login_paces_requests(monkeypatch):
     assert captured["request_interval"] == 1
 
 
-# ---- 批量下载链接 ----
+# ---- 下载链接（单文件接口逐个取；服务端已禁止批量 get_download_url） ----
 
 
-def _url_resp(file_id, url, status=200):
-    return SimpleNamespace(id=file_id, status=status, body=SimpleNamespace(url=url))
+def _url_resp(url):
+    return SimpleNamespace(url=url)
 
 
-class FakeBatchAli:
+class FakeUrlAli:
     def __init__(self, responses):
         self.responses = responses
+        self.calls = []
 
-    def batch_download_url(self, file_id_list):
-        return self.responses
+    def get_download_url(self, file_id, **kw):
+        self.calls.append(file_id)
+        return self.responses[file_id]
 
 
 def test_get_download_urls_maps_ids():
-    ali = FakeBatchAli([_url_resp("f1", "u1"), _url_resp("f2", "u2")])
+    ali = FakeUrlAli({"f1": _url_resp("u1"), "f2": _url_resp("u2")})
     assert _storage_with(ali).get_download_urls(["f1", "f2"]) == {"f1": "u1", "f2": "u2"}
+    assert ali.calls == ["f1", "f2"]
 
 
 def test_get_download_urls_skips_failed_items():
-    ali = FakeBatchAli([
-        _url_resp("f1", "u1"),
-        SimpleNamespace(id="f2", status=403, body={"code": "Forbidden"}),
-    ])
-    assert _storage_with(ali).get_download_urls(["f1", "f2"]) == {"f1": "u1"}
+    ali = FakeUrlAli({"f1": _url_resp("u1"), "f2": _null(), "f3": _url_resp(None)})
+    assert _storage_with(ali).get_download_urls(["f1", "f2", "f3"]) == {"f1": "u1"}
 
 
-def test_get_download_urls_null_raises():
+def test_get_download_urls_not_logged_in_raises():
     with pytest.raises(StorageError):
-        _storage_with(FakeBatchAli([_null()])).get_download_urls(["f1"])
+        AligoStorage().get_download_urls(["f1"])
 
 
 # ---- 流式下载 ----
@@ -288,7 +288,7 @@ def test_read_manifest_folder_with_same_name_returns_none():
 def test_read_manifest_parses_content(monkeypatch):
     body = json.dumps({"version": 1, "files": [{"path": "a.png", "size": 3}]}).encode("utf-8")
     ali = FakeAli({}, {}, {"p/media.gmsync": _file("m", "media.gmsync", len(body))})
-    ali.batch_download_url = lambda file_id_list: [_url_resp("m", "u")]
+    ali.get_download_url = lambda file_id, **kw: _url_resp("u")
     monkeypatch.setattr(storage.requests, "get", lambda url, **kw: FakeResp(body))
     m = _storage_with(ali).read_manifest("p")
     assert m.files == [ManifestFile("a.png", 3)]
@@ -296,7 +296,7 @@ def test_read_manifest_parses_content(monkeypatch):
 
 def test_read_manifest_bad_json_raises(monkeypatch):
     ali = FakeAli({}, {}, {"p/media.gmsync": _file("m", "media.gmsync", 5)})
-    ali.batch_download_url = lambda file_id_list: [_url_resp("m", "u")]
+    ali.get_download_url = lambda file_id, **kw: _url_resp("u")
     monkeypatch.setattr(storage.requests, "get", lambda url, **kw: FakeResp(b"{ bad"))
     with pytest.raises(ManifestError):
         _storage_with(ali).read_manifest("p")

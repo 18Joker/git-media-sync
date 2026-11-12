@@ -99,15 +99,20 @@ class AligoStorage:
                 )
 
     def get_download_urls(self, file_ids: list[str]) -> dict[str, str]:
-        """批量取下载链接（aligo 按 100 个/批拆分）；失败的 file_id 不在结果中。"""
+        """逐文件取下载链接；失败的 file_id 不在结果中。
+
+        服务端已禁止 /v3/batch 内调 get_download_url（整体 400），只能用单文件接口。
+        """
         if self._ali is None:
             raise StorageError("尚未登录")
         urls: dict[str, str] = {}
-        for resp in self._ali.batch_download_url(file_id_list=file_ids):
+        for fid in file_ids:
+            resp = self._ali.get_download_url(file_id=fid)
             if isinstance(resp, Null):
-                raise StorageError("批量获取下载链接失败")
-            if resp.status == 200 and getattr(resp.body, "url", None):
-                urls[resp.id] = resp.body.url
+                continue
+            url = getattr(resp, "url", None)
+            if url:
+                urls[fid] = url
         return urls
 
     def read_manifest(self, cloud_path: str) -> Manifest | None:
