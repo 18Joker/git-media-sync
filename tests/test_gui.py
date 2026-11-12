@@ -6,8 +6,9 @@ import pytest
 
 from downloader import gui
 from downloader.config import CacheStore, Config, ConfigStore, Project
-from downloader.core import CloudFile, FileEntry
+from downloader.core import CloudFile, FileEntry, NotAGitRepo
 from downloader.gui import App
+from downloader.manifest import parse_manifest
 from downloader.storage import StorageError
 
 
@@ -321,3 +322,55 @@ def test_log_prefixes_timestamp(app):
     app._log("hello")
     text = app.log.get("1.0", "end").strip()
     assert re.match(r"^\d{2}:\d{2}:\d{2} hello$", text)
+
+
+# ---- 生成清单 ----
+
+
+def test_generate_worker_writes_manifest(app, monkeypatch, tmp_path):
+    monkeypatch.setattr(gui, "git_tracked", lambda root: {"tracked.png"})
+    (tmp_path / "a.png").write_bytes(b"123")
+    (tmp_path / "tracked.png").write_bytes(b"1")
+    (tmp_path / "b.txt").write_bytes(b"1")
+    app._generate_worker(str(tmp_path), "")
+    done = [m for m in _drain(app) if m[0] == "done"][-1]
+    assert "已生成 media.gmsync：1 个文件" in done[1]
+    assert parse_manifest((tmp_path / "media.gmsync").read_text(encoding="utf-8")).files[0].path == "a.png"
+
+
+def test_generate_worker_custom_exts(app, monkeypatch, tmp_path):
+    monkeypatch.setattr(gui, "git_tracked", lambda root: set())
+    (tmp_path / "a.png").write_bytes(b"1")
+    (tmp_path / "b.txt").write_bytes(b"1")
+    app._generate_worker(str(tmp_path), "txt")
+    m = parse_manifest((tmp_path / "media.gmsync").read_text(encoding="utf-8"))
+    assert [f.path for f in m.files] == ["b.txt"]
+
+
+def test_generate_worker_not_git_repo(app, monkeypatch, tmp_path):
+    def boom(root):
+        raise NotAGitRepo("no git")
+    monkeypatch.setattr(gui, "git_tracked", boom)
+    app._generate_worker(str(tmp_path), "")
+    assert any(m[0] == "error" for m in _drain(app))
+
+
+def test_generate_requires_no_login(app, monkeypatch, tmp_path):
+    app.logged_in = False
+    app._set_busy(False)
+    app.local_var.set(str(tmp_path))
+    calls = []
+    monkeypatch.setattr(app, "_run", lambda fn: calls.append(fn))
+    app._generate_manifest()
+    assert len(calls) == 1
+    app._set_busy(False)
+
+
+def test_project_dialog_carries_exts(app):
+    dlg = gui.ProjectDialog(app)
+    dlg.name_var.set("A2")
+    dlg.cloud_var.set("/c")
+    dlg.local_var.set("/l")
+    dlg.exts_var.set("jpg, png")
+    dlg._ok()
+    assert dlg.result == Project("A2", "/c", "/l", "jpg, png")

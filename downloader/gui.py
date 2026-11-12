@@ -22,6 +22,7 @@ from downloader.core import (
     git_tracked,
     selected_entries,
 )
+from downloader.manifest import MANIFEST_NAME, parse_exts, scan_media_files, write_manifest
 from downloader.storage import AligoStorage, DownloadCancelled, StorageError, download_url_to
 
 STATUS_LABEL = {"pending": "待下载", "overwrite": "将覆盖", "same": "已相同"}
@@ -74,6 +75,7 @@ class ProjectDialog(tk.Toplevel):
         self.name_var = tk.StringVar(value=project.name if project else "")
         self.cloud_var = tk.StringVar(value=project.cloud_path if project else "")
         self.local_var = tk.StringVar(value=project.local_path if project else "")
+        self.exts_var = tk.StringVar(value=project.exts if project else "")
 
         ttk.Label(frm, text="名称(别名)").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(frm, textvariable=self.name_var, width=40).grid(
@@ -86,9 +88,16 @@ class ProjectDialog(tk.Toplevel):
         ttk.Label(frm, text="本地路径").grid(row=2, column=0, sticky="w", pady=3)
         ttk.Entry(frm, textvariable=self.local_var, width=40).grid(row=2, column=1, pady=3)
         ttk.Button(frm, text="浏览", command=self._browse).grid(row=2, column=2, padx=(6, 0))
+        ttk.Label(frm, text="素材后缀").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Entry(frm, textvariable=self.exts_var, width=40).grid(
+            row=3, column=1, columnspan=2, pady=3
+        )
+        ttk.Label(frm, text="逗号分隔，留空使用默认（jpg png mp4 等）").grid(
+            row=4, column=1, columnspan=2, sticky="w"
+        )
 
         btns = ttk.Frame(frm)
-        btns.grid(row=3, column=0, columnspan=3, pady=(10, 0), sticky="e")
+        btns.grid(row=5, column=0, columnspan=3, pady=(10, 0), sticky="e")
         ttk.Button(btns, text="取消", command=self.destroy).pack(side="right", padx=(6, 0))
         ttk.Button(btns, text="确定", command=self._ok).pack(side="right")
         self.bind("<Return>", lambda e: self._ok())
@@ -107,7 +116,7 @@ class ProjectDialog(tk.Toplevel):
         if not name or not cloud or not local:
             messagebox.showwarning("提示", "名称、云盘路径、本地路径都不能为空", parent=self)
             return
-        self.result = Project(name, cloud, local)
+        self.result = Project(name, cloud, local, self.exts_var.get().strip())
         self.destroy()
 
 
@@ -411,6 +420,8 @@ class App(tk.Tk):
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         self.list_btn = ttk.Button(bar, text="列出文件", command=self._list_files)
         self.list_btn.pack(side="left")
+        self.gen_btn = ttk.Button(bar, text="生成清单", command=self._generate_manifest)
+        self.gen_btn.pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="全选", command=self._select_all).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="全不选", command=self._select_none).pack(side="left", padx=6)
         ttk.Button(bar, text="反选", command=self._invert).pack(side="left")
@@ -446,6 +457,7 @@ class App(tk.Tk):
     def _set_busy(self, busy: bool):
         self._busy = busy
         self.list_btn.configure(state="disabled" if busy else "normal")
+        self.gen_btn.configure(state="disabled" if busy else "normal")
         self.cancel_btn.configure(state="normal" if busy else "disabled")
         self._update_download_button()
 
@@ -493,6 +505,40 @@ class App(tk.Tk):
             return
         self.cache.save(cloud, cloud_files)
         self._q.put(("entries", build_entries(cloud_files, root, tracked), cached is not None))
+
+    # ---- 生成清单 ----
+    def _generate_manifest(self):
+        if self._busy:
+            return
+        local = self.local_var.get().strip()
+        if not local:
+            messagebox.showwarning("提示", "请填写本地路径")
+            return
+        p = self._current()
+        exts = p.exts if p else ""
+        self._set_busy(True)
+        self._log(f"正在扫描 {local} 生成清单 …")
+        self._run(lambda: self._generate_worker(local, exts))
+
+    def _generate_worker(self, local: str, exts: str):
+        root = Path(local)
+        try:
+            tracked = git_tracked(root)
+        except NotAGitRepo as e:
+            self._q.put(("error", f"本地不是 git 仓库或未安装 git：{e}"))
+            return
+        try:
+            files = scan_media_files(root, tracked, parse_exts(exts))
+            write_manifest(root, files)
+        except OSError as e:
+            self._q.put(("error", f"生成清单失败：{e}"))
+            return
+        total = human_size(sum(f.size for f in files))
+        self._q.put((
+            "done",
+            f"已生成 {MANIFEST_NAME}：{len(files)} 个文件，共 {total}。"
+            "等待自动同步上传后，即可在其他设备列出下载",
+        ))
 
     def _clear_tree(self):
         self.tree.delete(*self.tree.get_children())
