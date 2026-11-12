@@ -33,6 +33,15 @@ def test_git_tracked_not_repo(monkeypatch):
         git_tracked(Path("x"))
 
 
+def test_git_tracked_git_not_installed(monkeypatch):
+    def boom(*a, **k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(NotAGitRepo):
+        git_tracked(Path("x"))
+
+
 def test_build_entries_skip_tracked_and_git(tmp_path):
     cf = [
         CloudFile("a.png", "a.png", 1, "f1"),

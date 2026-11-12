@@ -1,5 +1,6 @@
 """项目配置：app_dir 定位 + Project/Config 数据类 + JSON 读写。"""
 import json
+import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,9 +32,13 @@ class ConfigStore:
     def load(self) -> Config:
         if not self.path.exists():
             return Config([])
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        projects = [Project(**p) for p in data.get("projects", [])]
-        return Config(projects, last=data.get("last"))
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            projects = [Project(**p) for p in data.get("projects", [])]
+            return Config(projects, last=data.get("last"))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            os.replace(self.path, self.path.with_name(self.path.name + ".bak"))
+            return Config([])
 
     def save(self, config: Config) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,6 +46,8 @@ class ConfigStore:
             "projects": [asdict(p) for p in config.projects],
             "last": config.last,
         }
-        self.path.write_text(
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        os.replace(tmp, self.path)

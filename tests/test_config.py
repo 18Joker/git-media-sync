@@ -26,3 +26,16 @@ def test_app_dir_frozen(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(tmp_path / "app.exe"))
     assert app_dir() == tmp_path
+
+
+def test_load_corrupt_returns_empty_and_backs_up(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text("{ not json", encoding="utf-8")
+    assert ConfigStore(p).load() == Config([])
+    assert (tmp_path / "c.json.bak").exists()
+
+
+def test_load_bad_shape_returns_empty(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text('{"projects": [{"name": "x"}]}', encoding="utf-8")
+    assert ConfigStore(p).load() == Config([])

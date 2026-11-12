@@ -148,6 +148,7 @@ class App(tk.Tk):
         self._checked: set[str] = set()
         self._cancel = threading.Event()
         self._busy = False
+        self._login_busy = False
 
         cfg = self.store.load()
         self.projects: list[Project] = list(cfg.projects)
@@ -229,6 +230,7 @@ class App(tk.Tk):
     def _load_project(self, p: Project):
         self.cloud_var.set(p.cloud_path)
         self.local_var.set(p.local_path)
+        self._clear_tree()
 
     def _on_select_project(self, _event=None):
         p = self._current()
@@ -290,7 +292,10 @@ class App(tk.Tk):
         self._start_qr_login(self._login_dialog)
 
     def _start_qr_login(self, dialog: LoginDialog):
-        dialog.set_status("正在获取二维码…")
+        if self._login_busy:
+            return
+        self._login_busy = True
+        dialog.set_status("登录中，请用阿里云盘 App 扫码…")
         self._run(lambda: self._qr_worker())
 
     def _qr_worker(self):
@@ -301,10 +306,13 @@ class App(tk.Tk):
             self._q.put(("login_err", str(e)))
 
     def _start_token_login(self, dialog: LoginDialog):
+        if self._login_busy:
+            return
         token = dialog.token_var.get().strip()
         if not token:
             dialog.set_status("请先粘贴 refresh_token")
             return
+        self._login_busy = True
         dialog.set_status("正在用 token 登录…")
         self._run(lambda: self._token_worker(token))
 
@@ -335,6 +343,7 @@ class App(tk.Tk):
             if self._login_dialog and self._login_dialog.winfo_exists():
                 self._login_dialog.show_qr(msg[1])
         elif kind == "login_ok":
+            self._login_busy = False
             self.logged_in = True
             self.login_status.configure(text=f"已登录：{msg[1]}")
             if self._login_dialog and self._login_dialog.winfo_exists():
@@ -342,6 +351,7 @@ class App(tk.Tk):
             self._login_dialog = None
             self._log(f"登录成功：{msg[1]}")
         elif kind == "login_err":
+            self._login_busy = False
             if self._login_dialog and self._login_dialog.winfo_exists():
                 self._login_dialog.set_status(f"登录失败：{msg[1]}")
             self._log(f"登录失败：{msg[1]}")
@@ -395,10 +405,9 @@ class App(tk.Tk):
 
     def _set_busy(self, busy: bool):
         self._busy = busy
-        state = "disabled" if busy else "normal"
-        self.list_btn.configure(state=state)
-        self.download_btn.configure(state=state)
+        self.list_btn.configure(state="disabled" if busy else "normal")
         self.cancel_btn.configure(state="normal" if busy else "disabled")
+        self._update_download_button()
 
     def _list_files(self):
         if self._busy:
@@ -412,7 +421,7 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请填写云盘路径和本地路径")
             return
         self._set_busy(True)
-        self.tree.delete(*self.tree.get_children())
+        self._clear_tree()
         self._log(f"正在列出 {cloud} …")
         self._run(lambda: self._list_worker(cloud, local))
 
@@ -428,6 +437,14 @@ class App(tk.Tk):
             self._q.put(("error", str(e)))
         except Exception as e:  # noqa: BLE001 - 后台异常需回报 GUI
             self._q.put(("error", str(e)))
+
+    def _clear_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self._entries = []
+        self._roots = []
+        self._node_by_item = {}
+        self._checked = set()
+        self._update_download_button()
 
     def _populate(self, entries: list[FileEntry]):
         self.tree.delete(*self.tree.get_children())
@@ -510,7 +527,11 @@ class App(tk.Tk):
         self._refresh_checks()
 
     def _update_download_button(self):
-        self.download_btn.configure(text=f"下载选中({len(self._checked)})")
+        enabled = (not self._busy) and bool(self._entries)
+        self.download_btn.configure(
+            text=f"下载选中({len(self._checked)})",
+            state="normal" if enabled else "disabled",
+        )
 
     # ---- 下载 ----
     def _download_selected(self):
@@ -535,7 +556,7 @@ class App(tk.Tk):
             if self._cancel.is_set():
                 break
             try:
-                self.storage.download_to(e.file_id, local / e.relpath)
+                self.storage.download_to(e.file_id, local / e.relpath, expected_size=e.size)
                 ok += 1
                 self._q.put(("progress", f"✓ {e.relpath}"))
             except Exception as ex:  # noqa: BLE001
