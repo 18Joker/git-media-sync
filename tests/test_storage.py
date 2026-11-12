@@ -1,3 +1,4 @@
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,8 @@ import requests
 from aligo import Null
 
 from downloader import storage
+from downloader.core import CloudFile
+from downloader.manifest import Manifest, ManifestError, ManifestFile
 from downloader.storage import AligoStorage, StorageError
 
 
@@ -25,13 +28,17 @@ def _null():
 class FakeAli:
     """模拟 aligo 真实契约：get_folder_by_path 只解析文件夹，文件/缺失返回 None。"""
 
-    def __init__(self, folders_by_path, children):
+    def __init__(self, folders_by_path, children, files_by_path=None):
         self.folders_by_path = folders_by_path
         self.children = children
+        self.files_by_path = files_by_path
         self.list_kwargs = []
 
     def get_folder_by_path(self, path, create_folder=False):
         return self.folders_by_path.get(path.strip("/"))
+
+    def get_file_by_path(self, path):
+        return (self.files_by_path or {}).get(path.strip("/"))
 
     def get_file_list(self, parent_file_id, **kw):
         self.list_kwargs.append(kw)
@@ -252,3 +259,75 @@ def test_download_url_cancel_before_start(tmp_path):
     with pytest.raises(storage.DownloadCancelled):
         storage.download_url_to("u", tmp_path / "a.bin", cancel=cancel, session=s)
     assert s.requests == []
+
+
+# ---- 清单读取与精准定位 ----
+
+
+def _manifest(*files):
+    return Manifest(1, "t", list(files))
+
+
+class FakeResp:
+    def __init__(self, content):
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+
+def test_read_manifest_missing_returns_none():
+    assert _storage_with(FakeAli({}, {})).read_manifest("p") is None
+
+
+def test_read_manifest_folder_with_same_name_returns_none():
+    ali = FakeAli({}, {}, {"p/media.gmsync": _folder("m", "media.gmsync")})
+    assert _storage_with(ali).read_manifest("p") is None
+
+
+def test_read_manifest_parses_content(monkeypatch):
+    body = json.dumps({"version": 1, "files": [{"path": "a.png", "size": 3}]}).encode("utf-8")
+    ali = FakeAli({}, {}, {"p/media.gmsync": _file("m", "media.gmsync", len(body))})
+    ali.batch_download_url = lambda file_id_list: [_url_resp("m", "u")]
+    monkeypatch.setattr(storage.requests, "get", lambda url, **kw: FakeResp(body))
+    m = _storage_with(ali).read_manifest("p")
+    assert m.files == [ManifestFile("a.png", 3)]
+
+
+def test_read_manifest_bad_json_raises(monkeypatch):
+    ali = FakeAli({}, {}, {"p/media.gmsync": _file("m", "media.gmsync", 5)})
+    ali.batch_download_url = lambda file_id_list: [_url_resp("m", "u")]
+    monkeypatch.setattr(storage.requests, "get", lambda url, **kw: FakeResp(b"{ bad"))
+    with pytest.raises(ManifestError):
+        _storage_with(ali).read_manifest("p")
+
+
+def test_resolve_groups_and_matches():
+    folders = {"p": _folder("root", "p"), "p/assets": _folder("sub", "assets")}
+    children = {
+        "root": [_file("f1", "a.png", 3), _file("x", "unlisted.png", 9)],
+        "sub": [_file("f2", "b.png", 4), _folder("f3", "c.png"), _file("f4", "d.png", 99)],
+    }
+    m = _manifest(ManifestFile("a.png", 3), ManifestFile("assets/b.png", 4),
+                  ManifestFile("assets/c.png", 5), ManifestFile("assets/d.png", 5),
+                  ManifestFile("assets/gone.png", 1))
+    calls = []
+    files, warnings = _storage_with(FakeAli(folders, children)).resolve_manifest_files(
+        "p", m, on_progress=lambda d, n: calls.append((d, n)))
+    assert files == [CloudFile("a.png", "a.png", 3, "f1"), CloudFile("assets/b.png", "b.png", 4, "f2")]
+    assert len(warnings) == 3  # c.png 是文件夹、d.png 大小不符、gone.png 缺失
+    assert calls == [(1, 1), (2, 2)]
+
+
+def test_resolve_missing_folder_warns_and_skips():
+    m = _manifest(ManifestFile("nope/a.png", 3))
+    files, warnings = _storage_with(FakeAli({}, {})).resolve_manifest_files("p", m)
+    assert files == []
+    assert len(warnings) == 1 and "nope" in warnings[0]
+
+
+def test_resolve_null_item_raises():
+    folders = {"p": _folder("root", "p")}
+    children = {"root": [_null()]}
+    with pytest.raises(StorageError):
+        _storage_with(FakeAli(folders, children)).resolve_manifest_files("p", _manifest(ManifestFile("a.png", 3)))

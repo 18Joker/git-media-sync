@@ -12,6 +12,12 @@ import requests
 from aligo import Aligo, Null
 
 from downloader.core import CloudFile
+from downloader.manifest import (
+    MANIFEST_NAME,
+    Manifest,
+    group_by_folder,
+    parse_manifest,
+)
 
 _ILLEGAL = re.compile(r'[\\/:*?"<>|]')
 # 64KB：限速 ~33kB/s 时取消响应约 2 秒（1MB chunk 则要等 ~30 秒）
@@ -103,6 +109,71 @@ class AligoStorage:
             if resp.status == 200 and getattr(resp.body, "url", None):
                 urls[resp.id] = resp.body.url
         return urls
+
+    def read_manifest(self, cloud_path: str) -> Manifest | None:
+        """读云盘根目录的 media.gmsync；不存在（含同名文件夹）返回 None。"""
+        if self._ali is None:
+            raise StorageError("尚未登录")
+        base = cloud_path.strip("/")
+        item = self._ali.get_file_by_path(f"{base}/{MANIFEST_NAME}")
+        if item is None or isinstance(item, Null) or item.type != "file":
+            return None
+        url = self.get_download_urls([item.file_id]).get(item.file_id)
+        if not url:
+            raise StorageError("获取清单下载链接失败")
+        try:
+            resp = requests.get(url, headers={"Referer": _REFERER}, timeout=30)
+            resp.raise_for_status()
+            return parse_manifest(resp.content.decode("utf-8"))
+        except requests.RequestException as e:
+            raise StorageError(f"读取清单失败：{e}") from e
+
+    def resolve_manifest_files(
+        self,
+        cloud_path: str,
+        manifest: Manifest,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> tuple[list[CloudFile], list[str]]:
+        """按父目录分组单层列目录，精准定位清单文件；返回 (文件, 警告文案)。"""
+        if self._ali is None:
+            raise StorageError("尚未登录")
+        base = cloud_path.strip("/")
+        files: list[CloudFile] = []
+        warnings: list[str] = []
+        groups = group_by_folder(manifest.files)
+        for i, (folder, mfs) in enumerate(groups.items(), 1):
+            path = f"{base}/{folder}" if folder else base
+            parent = self._ali.get_folder_by_path(path, create_folder=False)
+            if parent is None or isinstance(parent, Null):
+                warnings.append(f"云端目录不存在，跳过 {len(mfs)} 个文件：{folder or '/'}")
+            else:
+                items = self._ali.get_file_list(
+                    parent_file_id=parent.file_id,
+                    image_thumbnail_process="",
+                    image_url_process="",
+                    video_thumbnail_process="",
+                )
+                by_name = {}
+                for item in items:
+                    if isinstance(item, Null):
+                        raise StorageError("列出云盘文件失败")
+                    if item.type != "folder":
+                        by_name[_sanitize(item.name)] = item
+                for mf in mfs:
+                    name = mf.path.rsplit("/", 1)[-1]
+                    item = by_name.get(name)
+                    if item is None:
+                        warnings.append(f"云端未找到：{mf.path}")
+                    elif (item.size or 0) != mf.size:
+                        warnings.append(
+                            f"云端大小与清单不符（可能同步未完成）：{mf.path}"
+                            f"（清单 {mf.size}，云端 {item.size or 0}）"
+                        )
+                    else:
+                        files.append(CloudFile(mf.path, name, mf.size, item.file_id))
+            if on_progress is not None:
+                on_progress(i, len(files))
+        return files, warnings
 
 
 def _remove(path: str) -> None:
