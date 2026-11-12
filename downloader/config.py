@@ -20,6 +20,7 @@ class Project:
     name: str
     cloud_path: str
     local_path: str
+    exts: str = ""
 
 
 @dataclass

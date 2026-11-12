@@ -88,3 +88,17 @@ def test_cache_save_overwrites_same_path(tmp_path):
     store.save("/a", [_cf("x.png")])
     store.save("/a", [_cf("z.png", 9)])
     assert store.load("/a")[0] == [_cf("z.png", 9)]
+
+
+def test_project_exts_default_and_roundtrip(tmp_path):
+    assert Project("a", "/c", "/l").exts == ""
+    store = ConfigStore(tmp_path / "c.json")
+    cfg = Config([Project("a", "/c", "/l", "jpg,png")])
+    store.save(cfg)
+    assert store.load() == cfg
+
+
+def test_load_old_config_without_exts(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text('{"projects": [{"name": "x", "cloud_path": "/c", "local_path": "/l"}]}', encoding="utf-8")
+    assert ConfigStore(p).load().projects[0].exts == ""

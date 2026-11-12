@@ -1,7 +1,10 @@
-"""media.gmsync 清单：数据模型、解析校验、按目录分组。纯逻辑，不依赖 aligo。"""
+"""media.gmsync 清单：数据模型、解析校验、按目录分组、本地扫描生成。纯逻辑，不依赖 aligo。"""
 import json
+import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 MANIFEST_NAME = "media.gmsync"
 MANIFEST_VERSION = 1
@@ -78,3 +81,44 @@ def group_by_folder(files: list[ManifestFile]) -> dict[str, list[ManifestFile]]:
         key = f.path.rsplit("/", 1)[0] if "/" in f.path else ""
         groups.setdefault(key, []).append(f)
     return groups
+
+
+DEFAULT_EXTS = frozenset(
+    "jpg jpeg png gif webp bmp svg mp4 mov mkv avi webm m4v mp3 wav flac m4a psd".split()
+)
+
+
+def parse_exts(text: str) -> frozenset[str]:
+    exts = {e.lower().lstrip(".") for e in re.split(r"[,，\s]+", text) if e.strip(" .")}
+    return frozenset(exts) if exts else DEFAULT_EXTS
+
+
+def scan_media_files(
+    local_root: Path, tracked: set[str], exts: frozenset[str]
+) -> list[ManifestFile]:
+    local_root = Path(local_root)
+    files: list[ManifestFile] = []
+    for dirpath, dirnames, filenames in os.walk(local_root):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            relpath = (Path(dirpath) / name).relative_to(local_root).as_posix()
+            if relpath in tracked:
+                continue
+            if os.path.splitext(name)[1].lower().lstrip(".") not in exts:
+                continue
+            files.append(ManifestFile(relpath, (Path(dirpath) / name).stat().st_size))
+    files.sort(key=lambda f: f.path)
+    return files
+
+
+def write_manifest(local_root: Path, files: list[ManifestFile]) -> Path:
+    path = Path(local_root) / MANIFEST_NAME
+    data = {
+        "version": MANIFEST_VERSION,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "files": [{"path": f.path, "size": f.size} for f in files],
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
