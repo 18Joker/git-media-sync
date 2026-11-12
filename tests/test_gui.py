@@ -8,7 +8,7 @@ from downloader import gui
 from downloader.config import CacheStore, Config, ConfigStore, Project
 from downloader.core import CloudFile, FileEntry, NotAGitRepo
 from downloader.gui import App
-from downloader.manifest import parse_manifest
+from downloader.manifest import Manifest, ManifestError, ManifestFile, parse_manifest
 from downloader.storage import StorageError
 
 
@@ -18,6 +18,10 @@ class FakeStorage:
         self.url_map = None
         self.cloud_files = []
         self.iter_error = None
+        self.manifest = None
+        self.manifest_error = None
+        self.resolve_result = ([], [])
+        self.iter_calls = 0
 
     def login_qr(self, on_qr):
         self.login_qr_calls += 1
@@ -32,11 +36,22 @@ class FakeStorage:
         return {fid: f"u-{fid}" for fid in file_ids}
 
     def iter_cloud_files(self, cloud_path, on_progress=None):
+        self.iter_calls += 1
         if self.iter_error is not None:
             raise self.iter_error
         if on_progress is not None:
             on_progress(1, len(self.cloud_files))
         yield from self.cloud_files
+
+    def read_manifest(self, cloud_path):
+        if self.manifest_error is not None:
+            raise self.manifest_error
+        return self.manifest
+
+    def resolve_manifest_files(self, cloud_path, manifest, on_progress=None):
+        if on_progress is not None:
+            on_progress(1, len(self.resolve_result[0]))
+        return self.resolve_result
 
 
 class FakeDialog:
@@ -374,3 +389,56 @@ def test_project_dialog_carries_exts(app):
     dlg.exts_var.set("jpg, png")
     dlg._ok()
     assert dlg.result == Project("A2", "/c", "/l", "jpg, png")
+
+
+# ---- 清单优先列举 ----
+
+
+def _manifest_setup(app, monkeypatch, manifest, result=([], []), error=None):
+    _list_setup(app, monkeypatch)
+    app.storage.manifest = manifest
+    app.storage.manifest_error = error
+    app.storage.resolve_result = result
+    app.storage.iter_calls = 0
+
+
+def test_list_worker_uses_manifest(app, monkeypatch, tmp_path):
+    m = Manifest(1, "2026-11-12T21:30:00", [ManifestFile("a.png", 3)])
+    _manifest_setup(app, monkeypatch, m,
+                    result=([CloudFile("a.png", "a.png", 3, "fid")], ["云端未找到：b.png"]))
+    app._list_worker("/cloud/A", str(tmp_path))
+    msgs = _drain(app)
+    fresh = [msg for msg in msgs if msg[0] == "entries"][-1]
+    assert fresh[1][0].relpath == "a.png"
+    assert app.storage.iter_calls == 0
+    assert any(msg[0] == "log" and "已读取清单 media.gmsync：1 个文件" in msg[1] for msg in msgs)
+    assert any(msg[0] == "log" and "⚠ 云端未找到：b.png" in msg[1] for msg in msgs)
+    assert app.cache.load("/cloud/A")[0] == [CloudFile("a.png", "a.png", 3, "fid")]
+
+
+def test_list_worker_falls_back_without_manifest(app, monkeypatch, tmp_path):
+    _manifest_setup(app, monkeypatch, None)
+    app.storage.cloud_files = [CloudFile("n.png", "n.png", 1, "nid")]
+    app._list_worker("/cloud/A", str(tmp_path))
+    msgs = _drain(app)
+    assert app.storage.iter_calls == 1
+    assert any(msg[0] == "log" and "回退全量扫描" in msg[1] for msg in msgs)
+    assert [msg for msg in msgs if msg[0] == "entries"][-1][1][0].relpath == "n.png"
+
+
+def test_list_worker_manifest_error_reports_no_fallback(app, monkeypatch, tmp_path):
+    _manifest_setup(app, monkeypatch, None, error=ManifestError("坏清单"))
+    app._list_worker("/cloud/A", str(tmp_path))
+    msgs = _drain(app)
+    assert any(msg[0] == "error" and "清单" in msg[1] for msg in msgs)
+    assert app.storage.iter_calls == 0
+    assert not [msg for msg in msgs if msg[0] == "entries"]
+
+
+def test_list_worker_manifest_network_error_keeps_cache(app, monkeypatch, tmp_path):
+    _manifest_setup(app, monkeypatch, None, error=StorageError("网络断了"))
+    app.cache.save("/cloud/A", [CloudFile("old.png", "old.png", 1, "oid")])
+    app._list_worker("/cloud/A", str(tmp_path))
+    msgs = _drain(app)
+    assert any(msg[0] == "cached_entries" for msg in msgs)
+    assert "刷新失败" in [msg for msg in msgs if msg[0] == "done"][-1][1]

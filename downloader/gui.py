@@ -22,7 +22,13 @@ from downloader.core import (
     git_tracked,
     selected_entries,
 )
-from downloader.manifest import MANIFEST_NAME, parse_exts, scan_media_files, write_manifest
+from downloader.manifest import (
+    MANIFEST_NAME,
+    ManifestError,
+    parse_exts,
+    scan_media_files,
+    write_manifest,
+)
 from downloader.storage import AligoStorage, DownloadCancelled, StorageError, download_url_to
 
 STATUS_LABEL = {"pending": "待下载", "overwrite": "将覆盖", "same": "已相同"}
@@ -493,12 +499,29 @@ class App(tk.Tk):
             self._q.put(("list_progress", folders, files))
 
         try:
-            cloud_files = list(self.storage.iter_cloud_files(cloud, on_progress=prog))
+            manifest = self.storage.read_manifest(cloud)
+            if manifest is not None:
+                self._q.put((
+                    "log",
+                    f"已读取清单 {MANIFEST_NAME}：{len(manifest.files)} 个文件"
+                    f"（生成于 {manifest.generated_at}）",
+                ))
+                cloud_files, warnings = self.storage.resolve_manifest_files(
+                    cloud, manifest, on_progress=prog
+                )
+                for w in warnings:
+                    self._q.put(("log", f"⚠ {w}"))
+            else:
+                self._q.put(("log", f"未找到 {MANIFEST_NAME}，回退全量扫描 …"))
+                cloud_files = list(self.storage.iter_cloud_files(cloud, on_progress=prog))
         except StorageError as e:
             if cached is not None:
                 self._q.put(("done", f"刷新失败：{e}（仍显示缓存）"))
             else:
                 self._q.put(("error", str(e)))
+            return
+        except ManifestError as e:
+            self._q.put(("error", f"清单文件损坏：{e}"))
             return
         except Exception as e:  # noqa: BLE001 - 后台异常需回报 GUI
             self._q.put(("error", str(e)))
