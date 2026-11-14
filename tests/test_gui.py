@@ -21,6 +21,8 @@ class FakeStorage:
         self.manifest = None
         self.manifest_error = None
         self.resolve_result = ([], [])
+        self.resolve_calls = 0
+        self.resolve_manifest = None
         self.iter_calls = 0
 
     def login_qr(self, on_qr):
@@ -49,6 +51,8 @@ class FakeStorage:
         return self.manifest
 
     def resolve_manifest_files(self, cloud_path, manifest, on_progress=None):
+        self.resolve_calls += 1
+        self.resolve_manifest = manifest
         if on_progress is not None:
             on_progress(1, len(self.resolve_result[0]))
         return self.resolve_result
@@ -172,7 +176,7 @@ def test_download_worker_runs_two_in_parallel(app, monkeypatch, tmp_path):
                 active -= 1
 
     _fake_download(monkeypatch, app, impl)
-    app._download_worker(_files(5), tmp_path)
+    app._download_worker(_files(5), tmp_path, "/cloud/A")
     msgs = _drain(app)
     done = [m for m in msgs if m[0] == "done"][-1]
     assert done[1] == "下载完成：成功 5，失败 0，取消 0"
@@ -188,7 +192,7 @@ def test_download_worker_cancel_counts(app, monkeypatch, tmp_path):
         return dest
 
     _fake_download(monkeypatch, app, impl)
-    app._download_worker(_files(5), tmp_path)
+    app._download_worker(_files(5), tmp_path, "/cloud/A")
     done = [m for m in _drain(app) if m[0] == "done"][-1]
     assert done[1] == "下载完成：成功 1，失败 0，取消 4"
 
@@ -196,7 +200,7 @@ def test_download_worker_cancel_counts(app, monkeypatch, tmp_path):
 def test_download_worker_missing_url_fails(app, monkeypatch, tmp_path):
     _fake_download(monkeypatch, app, _write_and_report)
     app.storage.url_map = {"id0": "u0"}
-    app._download_worker(_files(2), tmp_path)
+    app._download_worker(_files(2), tmp_path, "/cloud/A")
     msgs = _drain(app)
     done = [m for m in msgs if m[0] == "done"][-1]
     assert done[1] == "下载完成：成功 1，失败 1，取消 0"
@@ -210,18 +214,58 @@ def test_download_worker_url_fetch_failure(app, monkeypatch, tmp_path):
         raise StorageError("网络断了")
 
     monkeypatch.setattr(app.storage, "get_download_urls", boom)
-    app._download_worker(_files(2), tmp_path)
+    app._download_worker(_files(2), tmp_path, "/cloud/A")
     done = [m for m in _drain(app) if m[0] == "done"][-1]
     assert done[1] == "下载完成：成功 0，失败 2，取消 0"
 
 
 def test_download_worker_progress_messages(app, monkeypatch, tmp_path):
     _fake_download(monkeypatch, app, _write_and_report)
-    app._download_worker(_files(3), tmp_path)
+    app._download_worker(_files(3), tmp_path, "/cloud/A")
     msgs = _drain(app)
     assert ("dl_start", 3, 30) in msgs
     last = [m for m in msgs if m[0] == "dl_progress"][-1]
     assert last[1] == 3 and last[2] == 3 and last[3] == 30 and last[4] == 30
+
+
+def test_download_worker_resolves_manifest_entries(app, monkeypatch, tmp_path):
+    _fake_download(monkeypatch, app, _write_and_report)
+    app.storage.resolve_calls = 0
+    app.storage.resolve_result = ([CloudFile("f0.bin", "f0.bin", 10, "rid0")], [])
+    entries = [
+        FileEntry("f0.bin", "f0.bin", 10, "", "pending"),
+        FileEntry("f1.bin", "f1.bin", 10, "id1", "pending"),
+    ]
+    app._download_worker(entries, tmp_path, "/cloud/A")
+    msgs = _drain(app)
+    done = [m for m in msgs if m[0] == "done"][-1]
+    assert done[1] == "下载完成：成功 2，失败 0，取消 0"
+    assert app.storage.resolve_calls == 1
+    assert [f.path for f in app.storage.resolve_manifest.files] == ["f0.bin"]
+
+
+def test_download_worker_unresolved_entry_fails(app, monkeypatch, tmp_path):
+    _fake_download(monkeypatch, app, _write_and_report)
+    app.storage.resolve_result = ([], ["云端未找到：f0.bin"])
+    entries = [FileEntry("f0.bin", "f0.bin", 10, "", "pending")]
+    app._download_worker(entries, tmp_path, "/cloud/A")
+    msgs = _drain(app)
+    done = [m for m in msgs if m[0] == "done"][-1]
+    assert done[1] == "下载完成：成功 0，失败 1，取消 0"
+    assert any(m[0] == "log" and "⚠ 云端未找到：f0.bin" in m[1] for m in msgs)
+
+
+def test_download_worker_resolve_error_fails_missing(app, monkeypatch, tmp_path):
+    _fake_download(monkeypatch, app, _write_and_report)
+
+    def boom(cloud, manifest, on_progress=None):
+        raise StorageError("网络断了")
+
+    monkeypatch.setattr(app.storage, "resolve_manifest_files", boom)
+    entries = [FileEntry("f0.bin", "f0.bin", 10, "", "pending")]
+    app._download_worker(entries, tmp_path, "/cloud/A")
+    done = [m for m in _drain(app) if m[0] == "done"][-1]
+    assert done[1] == "下载完成：成功 0，失败 1，取消 0"
 
 
 def test_download_status_format():
@@ -409,21 +453,32 @@ def _manifest_setup(app, monkeypatch, manifest, result=([], []), error=None):
     app.storage.manifest = manifest
     app.storage.manifest_error = error
     app.storage.resolve_result = result
+    app.storage.resolve_calls = 0
     app.storage.iter_calls = 0
 
 
 def test_list_worker_uses_manifest(app, monkeypatch, tmp_path):
-    m = Manifest(1, "2026-11-12T21:30:00", [ManifestFile("a.png", 3)])
-    _manifest_setup(app, monkeypatch, m,
-                    result=([CloudFile("a.png", "a.png", 3, "fid")], ["云端未找到：b.png"]))
+    (tmp_path / "a.png").write_bytes(b"123")
+    m = Manifest(1, "2026-11-12T21:30:00", [
+        ManifestFile("a.png", 3),
+        ManifestFile("media.gmsync", 9),
+        ManifestFile("b.png", 4),
+    ])
+    _manifest_setup(app, monkeypatch, m)
     app._list_worker("/cloud/A", str(tmp_path))
     msgs = _drain(app)
     fresh = [msg for msg in msgs if msg[0] == "entries"][-1]
-    assert fresh[1][0].relpath == "a.png"
+    assert [(e.relpath, e.status, e.file_id) for e in fresh[1]] == [
+        ("a.png", "same", ""),
+        ("b.png", "pending", ""),
+    ]
     assert app.storage.iter_calls == 0
-    assert any(msg[0] == "log" and "已读取清单 media.gmsync：1 个文件" in msg[1] for msg in msgs)
-    assert any(msg[0] == "log" and "⚠ 云端未找到：b.png" in msg[1] for msg in msgs)
-    assert app.cache.load("/cloud/A")[0] == [CloudFile("a.png", "a.png", 3, "fid")]
+    assert app.storage.resolve_calls == 0
+    assert any(msg[0] == "log" and "已读取清单 media.gmsync：3 个文件" in msg[1] for msg in msgs)
+    assert app.cache.load("/cloud/A")[0] == [
+        CloudFile("a.png", "a.png", 3, ""),
+        CloudFile("b.png", "b.png", 4, ""),
+    ]
 
 
 def test_list_worker_falls_back_without_manifest(app, monkeypatch, tmp_path):

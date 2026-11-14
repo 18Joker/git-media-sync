@@ -7,4 +7,8 @@ dist/
 *.spec
 app.log
 config.json
+cache.json
+*.bak
+*.tmp
 .superpowers/
+.idea/

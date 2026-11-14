@@ -13,6 +13,7 @@ from PIL import ImageTk
 
 from downloader.config import CacheStore, Config, ConfigStore, Project
 from downloader.core import (
+    CloudFile,
     FileEntry,
     NotAGitRepo,
     TreeNode,
@@ -24,7 +25,10 @@ from downloader.core import (
 )
 from downloader.manifest import (
     MANIFEST_NAME,
+    MANIFEST_VERSION,
+    Manifest,
     ManifestError,
+    ManifestFile,
     parse_exts,
     scan_media_files,
     write_manifest,
@@ -506,11 +510,13 @@ class App(tk.Tk):
                     f"已读取清单 {MANIFEST_NAME}：{len(manifest.files)} 个文件"
                     f"（生成于 {manifest.generated_at}）",
                 ))
-                cloud_files, warnings = self.storage.resolve_manifest_files(
-                    cloud, manifest, on_progress=prog
-                )
-                for w in warnings:
-                    self._q.put(("log", f"⚠ {w}"))
+                # 清单即云端快照：列举只做本地 path+size 比对，
+                # file_id 留空、下载时按需解析，避免逐目录请求 SDK
+                cloud_files = [
+                    CloudFile(mf.path, mf.path.rsplit("/", 1)[-1], mf.size, "")
+                    for mf in manifest.files
+                    if mf.path != MANIFEST_NAME
+                ]
             else:
                 self._q.put(("log", f"未找到 {MANIFEST_NAME}，回退全量扫描 …"))
                 cloud_files = list(self.storage.iter_cloud_files(cloud, on_progress=prog))
@@ -679,16 +685,45 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "没有勾选任何文件")
             return
         local = Path(self.local_var.get().strip())
+        cloud = self.cloud_var.get().strip()
         self._cancel = threading.Event()
         self._set_busy(True)
         self._log(f"开始下载 {len(files)} 个文件 …")
-        self._run(lambda: self._download_worker(files, local))
+        self._run(lambda: self._download_worker(files, local, cloud))
 
-    def _download_worker(self, files: list[FileEntry], local: Path):
+    def _download_worker(self, files: list[FileEntry], local: Path, cloud: str):
         ok = fail = cancelled = 0
+        lock = threading.Lock()
+
+        # 清单生成的条目 file_id 为空：仅对选中子集按目录解析，顺带校验云端大小
+        missing = [e for e in files if not e.file_id]
+        if missing:
+            sub = Manifest(
+                MANIFEST_VERSION, "",
+                [ManifestFile(e.relpath, e.size) for e in missing],
+            )
+            try:
+                resolved, warnings = self.storage.resolve_manifest_files(cloud, sub)
+            except Exception as ex:  # noqa: BLE001 - 后台异常需回报 GUI
+                resolved, warnings = [], [f"解析云端文件失败：{ex}"]
+            for w in warnings:
+                self._q.put(("log", f"⚠ {w}"))
+            by_path = {cf.relpath: cf for cf in resolved}
+            kept: list[FileEntry] = []
+            for e in files:
+                if e.file_id:
+                    kept.append(e)
+                    continue
+                cf = by_path.get(e.relpath)
+                if cf is None:
+                    fail += 1
+                    self._q.put(("progress", f"✗ {e.relpath}: 云端未找到或大小与清单不符"))
+                else:
+                    kept.append(FileEntry(cf.relpath, cf.name, cf.size, cf.file_id, e.status))
+            files = kept
+
         total_bytes = sum(e.size for e in files)
         done_bytes = 0
-        lock = threading.Lock()
         self._q.put(("dl_start", len(files), total_bytes))
 
         def on_bytes(n: int):
